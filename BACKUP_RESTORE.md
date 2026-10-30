@@ -42,6 +42,17 @@
    - открываются Mini App и личный кабинет по HTTPS;
    - `sudo bash install.sh --check` — автоматическая проверка.
 
+
+## Отдельный скрипт восстановления `restore.sh`
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/samur005/AntiBS2vpn-installer/main/restore.sh) /root/antibs2vpn-fullbackup_XXXX.zip
+```
+Путь к бэкапу можно не указывать — скрипт спросит. Он определит тип бэкапа (полный zip / `db.dump` / частичный JSON) и:
+- если бот **не установлен** в `/opt/AntiBS2vpn` — скачает и запустит `install.sh --restore` (установка + восстановление);
+- если бот **установлен** — после подтверждения сделает страховочный дамп текущей БД (`backups/pre_restore_*.dump`), покажет различия `.env` (только имена ключей) и предложит заменить их, остановит бота и кабинет, пересоздаст БД, выполнит `pg_restore` (для JSON — штатный `scripts.restore_backup`), запустит всё и проверит через `install.sh --check`.
+
+Откат: `bash <(curl -fsSL https://raw.githubusercontent.com/samur005/AntiBS2vpn-installer/main/restore.sh) /opt/AntiBS2vpn/backups/pre_restore_XXXX.dump`
+
 ## Ручное восстановление (бот уже установлен)
 ```bash
 cd /opt/AntiBS2vpn
