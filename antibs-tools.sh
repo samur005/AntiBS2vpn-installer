@@ -17,7 +17,6 @@ kv_set() { # kv_set file KEY VALUE
   if grep -qE "^$k=" "$f"; then sed -i "s|^$k=.*|$k=$v|" "$f"; else printf '%s=%s\n' "$k" "$v" >>"$f"; fi
 }
 read_secret() { # read_secret "prompt" -> stdout
-  if [ "$PLAIN" = 0 ]; then whiptail --title "AntiBS2vpn" --passwordbox "$1" 10 72 3>&1 1>"$TTY" 2>&3 <"$TTY"; return; fi
   local s; printf '%s: ' "$1" >"$TTY"; IFS= read -rs s <"$TTY" || true; echo >"$TTY"; printf '%s' "$s"
 }
 psql_q() { docker exec -i "$PG" psql -U "$(db_user)" -d "$(db_name)" -v ON_ERROR_STOP=1 -tAq "$@"; }

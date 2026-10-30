@@ -7,23 +7,22 @@
 #  После установки в /usr/local/bin достаточно набрать: antibs
 #  Действия выполняют отдельные скрипты install.sh / restore.sh / update.sh /
 #  uninstall.sh и antibs-tools.sh (берутся рядом с этим файлом или скачиваются).
-#  Флаги: --dir DIR (по умолч. /opt/AntiBS2vpn), --plain (без whiptail), --version
+#  Флаги: --dir DIR (по умолч. /opt/AntiBS2vpn), --plain (оставлен для совместимости, меню всегда текстовое), --version
 # =============================================================================
 set -uo pipefail
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 APP_DIR="${APP_DIR:-/opt/AntiBS2vpn}"
 PROXY_DIR="${PROXY_DIR:-/opt/antibs-proxy}"
 RAW="${ANTIBS_RAW:-https://raw.githubusercontent.com/samur005/AntiBS2vpn-installer/main}"
 BIN=/usr/local/bin/antibs
 STATE_DIR=/etc/antibs2vpn
-PLAIN=0
 PG=antibs2vpn-postgres
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir) APP_DIR="$2"; shift 2;;
-    --plain) PLAIN=1; shift;;
+    --plain) shift;;  # совместимость: меню всегда текстовое
     --version) echo "$VERSION"; exit 0;;
     -h|--help) sed -n '2,11p' "$0" 2>/dev/null || true; exit 0;;
     *) echo "Неизвестный параметр: $1"; exit 1;;
@@ -32,45 +31,68 @@ done
 CAB_DIR="$APP_DIR/AntiBS2vpn-cabinet"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo /nonexistent)"
 
-c_g=$'\e[1;32m'; c_y=$'\e[1;33m'; c_b=$'\e[1;36m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then
+  c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+else c_g=; c_y=; c_r=; c_b=; c_d=; c_0=; fi
+export c_r
 TTY=/dev/tty; [ -r "$TTY" ] || TTY=/dev/stdin
 trap ':' INT   # Ctrl+C прерывает только текущее действие (логи), не меню
 say()  { printf '%s\n' "$*"; }
 warn() { printf '%s[!]%s %s\n' "$c_y" "$c_0" "$*" >&2; }
-pause() { printf '\n%sНажмите Enter, чтобы вернуться в меню...%s' "$c_d" "$c_0"; read -r _ <"$TTY" || true; }
+pause() { printf '\n%sНажмите Enter, чтобы продолжить%s' "$c_d" "$c_0"; read -r _ <"$TTY" || true; }
 
 [ "$(id -u)" = 0 ] || { echo "Запустите от root (sudo)."; exit 1; }
 
-# --- интерфейс: whiptail или обычное меню ------------------------------------------
-if [ "$PLAIN" = 0 ] && ! command -v whiptail >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-  echo "Устанавливаю whiptail для меню..."
-  { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq whiptail; } >/dev/null 2>&1 || true
-fi
-command -v whiptail >/dev/null 2>&1 || PLAIN=1
-
+# --- интерфейс: только текстовое меню (узкие экраны, телефонные SSH-клиенты) -------
+cols() { local c="${COLUMNS:-}"; [[ "$c" =~ ^[0-9]+$ ]] || c="$(tput cols 2>/dev/null || echo 80)"; [ "$c" -gt 20 ] 2>/dev/null || c=80; echo "$c"; }
+# перенос по словам с учётом UTF-8 (fold считает байты, кириллица ломается)
+case "${LC_ALL:-${LANG:-}}" in *[Uu][Tt][Ff]*) ;; *) export LC_ALL=C.UTF-8;; esac
+wrapw() { # wrapw ШИРИНА [ОТСТУП] < текст (сохраняет отступ строки)
+  local w="$1" ind="${2:-}" line lead cur word words
+  while IFS= read -r line || [ -n "$line" ]; do
+    lead="${line%%[! ]*}"; lead="$ind$lead"; cur=""
+    read -ra words <<<"$line"
+    for word in "${words[@]}"; do
+      if [ -z "$cur" ]; then cur="$word"
+      elif [ $(( ${#lead} + ${#cur} + 1 + ${#word} )) -le "$w" ]; then cur="$cur $word"
+      else printf '%s%s\n' "$lead" "$cur"; cur="$word"; fi
+    done
+    printf '%s%s\n' "$lead" "$cur"
+  done
+}
+wrap() { printf '%b\n' "$1" | wrapw "$(cols)"; }
+cls() { clear 2>/dev/null || printf '\n\n'; }
 yesno() {
-  if [ "$PLAIN" = 0 ]; then whiptail --title "AntiBS2vpn" --yesno "$1" 18 76 <"$TTY" >"$TTY" 2>&1; return; fi
-  local a; printf '%b [y/N]: ' "$1" >"$TTY"; read -r a <"$TTY" || true; [[ "$a" =~ ^[YyДд] ]]
+  local a
+  while :; do
+    { wrap "$1"; printf '[y/N]: '; } >"$TTY"; read -r a <"$TTY" || return 1
+    case "$a" in [YyДд]*) return 0;; ""|[NnНн]*) return 1;; esac
+  done
 }
-msg() {
-  if [ "$PLAIN" = 0 ]; then whiptail --title "AntiBS2vpn" --msgbox "$1" 20 78 <"$TTY" >"$TTY" 2>&1; else printf '%b\n' "$1"; pause; fi
-}
+msg() { wrap "$1" >"$TTY"; pause; }
 input() {
-  if [ "$PLAIN" = 0 ]; then whiptail --title "AntiBS2vpn" --inputbox "$1" 10 76 "${2:-}" 3>&1 1>"$TTY" 2>&3 <"$TTY"; return; fi
-  local a; printf '%s [%s]: ' "$1" "${2:-}" >"$TTY"; read -r a <"$TTY" || true; printf '%s' "${a:-${2:-}}"
+  local a; { wrap "$1"; [ -n "${2:-}" ] && printf '%s(Enter = %s)%s\n' "$c_d" "$2" "$c_0"; printf '> '; } >"$TTY"
+  read -r a <"$TTY" || true; printf '%s' "${a:-${2:-}}"
 }
 # choose "Заголовок" "текст" ПУНКТ "пояснение" ПУНКТ "пояснение" ... → выбранный ПУНКТ (пусто = назад)
 choose() {
   local title="$1" text="$2"; shift 2
-  if [ "$PLAIN" = 0 ]; then
-    whiptail --title "$title" --menu "$text" 24 100 15 "$@" 3>&1 1>"$TTY" 2>&3 <"$TTY" || true; return
-  fi
-  local items=("$@") i=0 n=1 sel
-  { clear; printf '%s=== %s ===%s\n%b\n\n' "$c_b" "$title" "$c_0" "$text"
-    while [ $i -lt ${#items[@]} ]; do printf '%2d) %s %s— %s%s\n' "$n" "${items[$i]}" "$c_d" "${items[$((i+1))]}" "$c_0"; i=$((i+2)); n=$((n+1)); done
-    printf ' 0) Назад / Выход\n\nВыбор: '; } >"$TTY"
-  read -r sel <"$TTY" || sel=0
-  if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ $((sel*2)) -le ${#items[@]} ]; then printf '%s' "${items[$(((sel-1)*2))]}"; fi
+  local items=("$@") i n sel w; w="$(cols)"; [ "$w" -gt 6 ] && w=$((w-1))
+  while :; do
+    { cls; printf '%s%s%s\n' "$c_b" "$title" "$c_0"; [ -n "$text" ] && wrap "$text"; echo
+      i=0; n=1
+      while [ $i -lt ${#items[@]} ]; do
+        printf '%2d) %s\n' "$n" "${items[$i]}"
+        printf '%s' "$c_d"; printf '%s\n' "${items[$((i+1))]}" | wrapw "$w" "    "; printf '%s' "$c_0"
+        i=$((i+2)); n=$((n+1))
+      done
+      printf ' 0) Назад / Выход\n\nНомер + Enter: '; } >"$TTY"
+    read -r sel <"$TTY" || { echo; return 0; }
+    sel="${sel//[[:space:]]/}"
+    [ "$sel" = 0 ] && return 0
+    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ $((sel*2)) -le ${#items[@]} ]; then printf '%s' "${items[$(((sel-1)*2))]}"; return 0; fi
+    printf '%sНет такого пункта: %s%s\n' "$c_y" "$sel" "$c_0" >"$TTY"; sleep 1
+  done
 }
 
 # --- вспомогательные скрипты: локальная копия рядом или скачивание ------------------
@@ -270,9 +292,12 @@ a_start_guide() {
 Готово? Главное меню → «Установить». Перенос со старого сервера —
 «Восстановить из бэкапа» (нужен файл antibs2vpn-fullbackup_*.zip[.enc]).
 GUIDE
-  if [ "$PLAIN" = 0 ]; then whiptail --title "С чего начать" --scrolltext --textbox "$f" 24 80 <"$TTY" >"$TTY" 2>&1
-  elif command -v less >/dev/null 2>&1; then less -R "$f" <"$TTY" >"$TTY"
-  else cat "$f"; pause; fi
+  local lines; lines="$(tput lines 2>/dev/null || echo 24)"
+  wrapw "$(cols)" <"$f" >"$f.w"; cls
+  if [ "$(wc -l <"$f.w")" -gt "$lines" ] && command -v less >/dev/null 2>&1; then
+    less -R -Ps'Стрелки/пробел — листать, q — выход' "$f.w" <"$TTY" >"$TTY"
+  else cat "$f.w" >"$TTY"; pause; fi
+  rm -f "$f.w"
   rm -f "$f"
 }
 
