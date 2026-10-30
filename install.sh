@@ -51,7 +51,7 @@ while [ $# -gt 0 ]; do
     --token) GH_TOKEN_VAL="$2"; shift 2;;
     --env-file) ENV_FILE_IN="$2"; shift 2;;
     -y|--yes) ASSUME_YES=1; shift;;
-    --restore) RESTORE_FILE="$2"; shift 2;;
+    --restore) RESTORE_FILE="$(readlink -f "$2")"; shift 2;;
     --no-caddy) USE_CADDY=0; shift;;
     --check) ONLY_CHECK=1; shift;;
     -h|--help) usage;;
@@ -234,6 +234,32 @@ fetch_code() {
     git_auth clone -q -b "$BRANCH" "$REPO_URL" "$APP_DIR" || die "git clone $REPO_URL не удался"
   fi
   mkdir -p "$APP_DIR/backups"
+}
+
+# Из full-бэкапа (zip с code.tgz) берём старые .env бота и кабинета, чтобы не вводить всё заново.
+preload_env_from_backup() {
+  [ -n "$RESTORE_FILE" ] || return 0
+  [ -f "$RESTORE_FILE" ] || die "Нет файла бэкапа $RESTORE_FILE"
+  case "$RESTORE_FILE" in *.zip) ;; *) return 0;; esac
+  unzip -l "$RESTORE_FILE" 2>/dev/null | grep -q ' code.tgz$' || return 0
+  step "Чтение .env из бэкапа"
+  local tmp; tmp="$(mktemp -d)"
+  unzip -qo "$RESTORE_FILE" code.tgz -d "$tmp"
+  tar xzf "$tmp/code.tgz" -C "$tmp" ./.env ./AntiBS2vpn-cabinet/.env 2>/dev/null || true
+  local src dst
+  for src in .env AntiBS2vpn-cabinet/.env; do
+    dst="$APP_DIR/$src"; [ -s "$tmp/$src" ] || continue
+    if [ -f "$dst" ] && ! confirm "Заменить текущий $dst значениями из бэкапа?" y; then continue; fi
+    [ -f "$dst" ] && cp -p "$dst" "$dst.bak.$(date +%s)"
+    install -m 600 "$tmp/$src" "$dst"; log "$src восстановлен из бэкапа"
+  done
+  if docker volume inspect antibs2vpn_bot_postgres_data >/dev/null 2>&1; then
+    warn "Том БД уже существует: если пароль БД в бэкапе другой, бот не подключится."
+    if confirm "Удалить текущий том БД (данные в нём будут заменены бэкапом)?" n; then
+      (cd "$APP_DIR" && docker compose down -v) >/dev/null 2>&1 || docker volume rm -f antibs2vpn_bot_postgres_data >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -rf "$tmp"
 }
 
 # --- 2. вопросы ----------------------------------------------------------------
@@ -457,34 +483,56 @@ wait_pg() {
   done; return 1
 }
 
-do_restore() {
+RESTORE_KIND=""
+detect_restore() {
   [ -n "$RESTORE_FILE" ] || return 0
-  step "Восстановление из $RESTORE_FILE"
-  [ -f "$RESTORE_FILE" ] || die "Нет файла $RESTORE_FILE"
-  local tmp; tmp="$(mktemp -d)"
-  if [[ "$RESTORE_FILE" == *.zip ]] && unzip -l "$RESTORE_FILE" 2>/dev/null | grep -q 'db.dump'; then
-    unzip -qo "$RESTORE_FILE" db.dump -d "$tmp" || unzip -qo "$RESTORE_FILE" -d "$tmp"
-    RESTORE_FILE="$(find "$tmp" -name db.dump | head -1)"
-  fi
+  if [[ "$RESTORE_FILE" == *.dump ]]; then RESTORE_KIND=dump
+  elif unzip -l "$RESTORE_FILE" 2>/dev/null | grep -q ' db.dump$'; then RESTORE_KIND=fullzip
+  elif unzip -l "$RESTORE_FILE" 2>/dev/null | grep -qE 'bot_backup_.*\.json$'; then RESTORE_KIND=json
+  else die "Неизвестный формат бэкапа: $RESTORE_FILE (ожидается antibs2vpn-fullbackup_*.zip, db.dump или bot_backup_*.zip)"; fi
+  log "Формат бэкапа: $RESTORE_KIND"
+  [ "$RESTORE_KIND" = json ] && warn "bot_backup_*.zip содержит только 7 таблиц (users, tariffs, subscriptions, payments, transactions, promocodes, settings). Панели, доп. услуги, тексты экранов и пр. НЕ восстановятся — используйте full-бэкап, если он есть."
+  return 0
+}
+
+# Полный дамп pg_dump -Fc: восстанавливаем в пустую БД ДО первого старта бота.
+restore_dump() {
+  local f="$RESTORE_FILE" tmp=""
+  if [ "$RESTORE_KIND" = fullzip ]; then tmp="$(mktemp -d)"; unzip -qo "$RESTORE_FILE" db.dump -d "$tmp"; f="$tmp/db.dump"; fi
+  step "Восстановление БД из $(basename "$RESTORE_FILE")"
   (cd "$APP_DIR" && docker compose stop bot >/dev/null 2>&1) || true
-  if [[ "$RESTORE_FILE" == *.dump ]]; then
-    docker exec -i antibs2vpn-postgres pg_restore -U "${V[POSTGRES_USER]}" -d "${V[POSTGRES_DB]}" --clean --if-exists --no-owner <"$RESTORE_FILE" \
-      || warn "pg_restore завершился с предупреждениями (обычно не критично)"
-  else
-    cp "$RESTORE_FILE" "$APP_DIR/backups/"
-    (cd "$APP_DIR" && docker compose run --rm bot python -m scripts.restore_backup "/app/backups/$(basename "$RESTORE_FILE")") || warn "restore_backup завершился с ошибкой"
-  fi
-  rm -rf "$tmp"
-  (cd "$APP_DIR" && docker compose up -d bot) || true
-  log "Восстановление завершено"
+  docker cp "$f" antibs2vpn-postgres:/tmp/restore.dump
+  if docker exec antibs2vpn-postgres pg_restore -U "${V[POSTGRES_USER]}" -d "${V[POSTGRES_DB]}" --clean --if-exists --no-owner --no-privileges /tmp/restore.dump; then
+    log "pg_restore: OK"
+  else warn "pg_restore завершился с предупреждениями — проверьте вывод выше"; fi
+  docker exec antibs2vpn-postgres rm -f /tmp/restore.dump || true
+  local n; n="$(docker exec antibs2vpn-postgres psql -U "${V[POSTGRES_USER]}" -d "${V[POSTGRES_DB]}" -tAc 'select count(*) from users' 2>/dev/null || echo '?')"
+  log "Пользователей в восстановленной БД: $n"
+  [ -n "$tmp" ] && rm -rf "$tmp"
+  return 0
+}
+
+# JSON-бэкап бота: таблицы должны быть уже созданы ботом, поэтому — ПОСЛЕ старта.
+restore_json() {
+  step "Восстановление из JSON-бэкапа бота"
+  cp "$RESTORE_FILE" "$APP_DIR/backups/"
+  local i; for i in $(seq 1 30); do docker logs antibs2vpn-bot 2>&1 | grep -q 'bot starting' && break; sleep 3; done
+  (cd "$APP_DIR" && docker compose exec -T bot python -m scripts.restore_backup "/app/backups/$(basename "$RESTORE_FILE")") \
+    || warn "restore_backup завершился с ошибкой"
+  (cd "$APP_DIR" && docker compose restart bot) >/dev/null || true
 }
 
 start_all() {
   step "Сборка и запуск контейнеров"
-  # на случай смены пароля БД при существующем томе
-  if [ -n "$RESTORE_FILE" ]; then (cd "$APP_DIR" && docker compose up -d postgres) || true; wait_pg || true; do_restore; fi
+  detect_restore
+  if [ "$RESTORE_KIND" = dump ] || [ "$RESTORE_KIND" = fullzip ]; then
+    (cd "$APP_DIR" && docker compose up -d postgres) || die "PostgreSQL не запустился"
+    wait_pg || die "PostgreSQL не готов: docker logs antibs2vpn-postgres"
+    restore_dump
+  fi
   compose_up "$APP_DIR" || die "Не удалось запустить бота. Логи: cd $APP_DIR && docker compose logs --tail 100"
   wait_pg || die "PostgreSQL не готов: docker logs antibs2vpn-postgres"
+  [ "$RESTORE_KIND" = json ] && restore_json
   compose_up "$CAB_DIR" || warn "Кабинет не запустился: cd $CAB_DIR && docker compose logs --tail 100"
   if [ "$USE_CADDY" = 1 ]; then compose_up "$PROXY_DIR" || warn "Caddy не запустился: docker logs antibs-caddy"; fi
 }
@@ -562,6 +610,7 @@ main() {
   check_system
   install_deps
   fetch_code
+  preload_env_from_backup
   collect
   write_envs
   prepare_host

@@ -43,7 +43,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/samur005/AntiBS2vpn-installe
 4. Спрашивает настройки с проверками: токен бота (через Telegram `getMe`), ID админов, домены (должны указывать на IP сервера), URL панелей (доступность), платёжные ключи. Необязательное можно пропустить Enter.
 5. Генерирует пароль БД и секреты, пишет `.env` бота и кабинета (chmod 600). При повторном запуске предлагает оставить текущие значения.
 6. Освобождает порты 80/443, открывает их в ufw, настраивает Caddy (HTTPS Let's Encrypt) в `/opt/antibs-proxy`.
-7. Собирает и запускает контейнеры (с повторами при сбое сборки), по желанию восстанавливает БД из бэкапа.
+7. Собирает и запускает контейнеры; с `--restore` берёт `.env` из full-бэкапа и восстанавливает БД (см. раздел RESTORE).
 8. Ставит systemd-сервис `antibs-recreate-watch` и cron ежедневного бэкапа.
 9. Проверяет: контейнеры, PostgreSQL, таблицы, `getMe`, логи на ошибки, `/health`, HTTPS. При проблемах пробует исправить и выводит диагностику.
 
@@ -67,3 +67,45 @@ bash <(curl -fsSL https://raw.githubusercontent.com/samur005/AntiBS2vpn-installe
 ```
 
 Подробная инструкция с описанием всех переменных — `INSTALL.md` в репозитории бота.
+
+## Восстановление из бэкапа на новом сервере (RESTORE)
+
+### Какие бэкапы делает бот
+| Файл | Когда (по умолч.) | Что внутри | Куда |
+|---|---|---|---|
+| `antibs2vpn-fullbackup_ГГГГММДД_ЧЧММСС.zip` | ежедневно 00:05 МСК (cron, `scripts/backup_full.sh`) | `db.dump` — **полный** дамп PostgreSQL (`pg_dump -Fc`, все таблицы); `code.tgz` — код бота и кабинета **вместе с `.env`**; README | в Telegram админам (настройка в админке) + `/opt/AntiBS2vpn/backups/` (хранится 7 шт.) |
+| `bot_backup_ГГГГ-ММ-ДД_ЧЧММСС.zip` | ежедневно 03:05 МСК (внутри бота) | JSON только 7 таблиц: users, tariffs, subscriptions, payments, transactions, promocodes, settings | в Telegram + `backups/` |
+
+**Для переноса используйте full-бэкап** — JSON-бэкап не содержит панелей, доп. услуг, текстов/картинок экранов и др.
+⚠ Full-бэкап содержит секреты (`.env`: токен бота, пароль БД, ключи платёжек) — храните его как пароль.
+
+### Пошагово
+1. Новый сервер (Ubuntu/Debian), DNS-записи доменов переведите на новый IP.
+2. Скачайте из Telegram последний `antibs2vpn-fullbackup_*.zip` и загрузите на сервер:
+   ```bash
+   scp antibs2vpn-fullbackup_*.zip root@НОВЫЙ_IP:/root/
+   ```
+3. **Остановите бота на старом сервере** (иначе два бота с одним токеном будут конфликтовать):
+   ```bash
+   cd /opt/AntiBS2vpn && docker compose stop bot
+   ```
+4. Запустите установщик с бэкапом:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/samur005/AntiBS2vpn-installer/main/install.sh -o install.sh
+   sudo bash install.sh --restore /root/antibs2vpn-fullbackup_XXXX.zip
+   ```
+   Установщик сам: возьмёт `.env` бота и кабинета из `code.tgz` (вопросы будут с уже заполненными ответами — жмите Enter), поднимет PostgreSQL, восстановит `db.dump` через `pg_restore` в пустую БД **до** первого запуска бота, затем запустит бота, кабинет и Caddy (сертификаты HTTPS выпустятся заново) и проверит работу.
+5. Проверьте: `/start` в боте, админка, `docker logs antibs2vpn-bot --tail 50`.
+
+### Вручную (если установщик уже отработал без бэкапа)
+```bash
+cd /opt/AntiBS2vpn
+unzip -o /root/antibs2vpn-fullbackup_XXXX.zip db.dump -d /tmp/rb
+docker compose stop bot
+docker cp /tmp/rb/db.dump antibs2vpn-postgres:/tmp/db.dump
+docker exec antibs2vpn-postgres pg_restore -U vpn_bot -d vpn_bot --clean --if-exists --no-owner --no-privileges /tmp/db.dump
+docker compose start bot
+```
+Только JSON-бэкап (частично): `docker compose exec bot python -m scripts.restore_backup /app/backups/bot_backup_XXXX.zip` (бот должен быть уже запущен — таблицы создаются при старте).
+
+Также поддерживается `--restore db.dump` и `--restore bot_backup_*.zip`.
