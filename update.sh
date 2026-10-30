@@ -25,8 +25,12 @@ done
 echo "[+] Бэкап БД перед обновлением"
 mkdir -p backups
 U="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)"; D="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2-)"
-docker exec antibs2vpn-postgres pg_dump -U "${U:-vpn_bot}" -Fc "${D:-vpn_bot}" > "backups/pre_update_$(date +%Y%m%d_%H%M%S).dump" || echo "[!] дамп не удался"
+PRE="$APP_DIR/backups/pre_update_$(date +%Y%m%d_%H%M%S).dump"
+docker exec antibs2vpn-postgres pg_dump -U "${U:-vpn_bot}" -Fc "${D:-vpn_bot}" > "$PRE" && chmod 600 "$PRE" || { echo "[!] дамп не удался"; PRE=""; }
 OLD="$(git rev-parse --short HEAD)"
+# для отката из меню antibs: предыдущий коммит + дамп БД
+mkdir -p /etc/antibs2vpn
+printf 'PREV_COMMIT=%s\nPREV_DUMP=%s\nUPDATED_AT=%s\n' "$(git rev-parse HEAD)" "$PRE" "$(date '+%F %T %Z')" >/etc/antibs2vpn/last_update
 git_auth fetch -q origin "$BRANCH" && git merge --ff-only "origin/$BRANCH" || { echo "[x] git: есть локальные изменения (git status). Отмена."; exit 1; }
 echo "[+] $OLD → $(git rev-parse --short HEAD)"
 docker compose up -d --build

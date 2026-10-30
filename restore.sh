@@ -8,6 +8,7 @@
 #    antibs2vpn-fullbackup_*.zip — полный (db.dump + code.tgz с .env)  ← рекомендуется
 #    *.dump                      — дамп pg_dump -Fc
 #    bot_backup_*.zip            — частичный JSON-бэкап бота (7 таблиц)
+#    *.zip.enc                   — зашифрованный (AES-256) полный бэкап: спросит пароль
 #
 #  Бот не установлен  → запускается install.sh --restore (установка + восстановление).
 #  Бот установлен     → восстановление поверх текущей установки
@@ -63,6 +64,28 @@ while :; do
   [ "$ASSUME_YES" = 1 ] && exit 1
 done
 
+# --- зашифрованный бэкап (*.enc, openssl AES-256) → расшифровка ---------------------
+DEC_DIR=""
+if [ "$(head -c 8 "$FILE")" = "Salted__" ]; then
+  step "Бэкап зашифрован — расшифровка"
+  command -v openssl >/dev/null || die "Нужен openssl"
+  DEC_DIR="$(mktemp -d /root/antibs-restore.XXXXXX)"; chmod 700 "$DEC_DIR"
+  OUT="$DEC_DIR/$(basename "${FILE%.enc}")"; [ "$OUT" = "$DEC_DIR/$(basename "$FILE")" ] && OUT="$OUT.zip"
+  ok=0
+  if [ -s /etc/antibs2vpn/backup.pass ] && openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$FILE" -out "$OUT" -pass file:/etc/antibs2vpn/backup.pass 2>/dev/null; then
+    ok=1; log "Расшифровано паролем из /etc/antibs2vpn/backup.pass"
+  fi
+  tries=0
+  while [ "$ok" = 0 ] && [ "$tries" -lt 3 ]; do
+    printf 'Пароль бэкапа (ввод скрыт): ' >"$TTY"; IFS= read -rs BPW <"$TTY" || true; echo >"$TTY"
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$FILE" -out "$OUT" -pass fd:3 3<<<"$BPW" 2>/dev/null; then ok=1; fi
+    unset BPW; tries=$((tries+1)); [ "$ok" = 1 ] || warn "Неверный пароль"
+  done
+  [ "$ok" = 1 ] || { rm -rf "$DEC_DIR"; die "Не удалось расшифровать бэкап"; }
+  chmod 600 "$OUT"; FILE="$OUT"
+fi
+cleanup_dec() { [ -n "$DEC_DIR" ] && rm -rf "$DEC_DIR"; return 0; }
+
 KIND=""
 if [[ "$FILE" == *.dump ]]; then
   head -c 5 "$FILE" | grep -q PGDMP || die "Это не дамп pg_dump -Fc"; KIND=dump
@@ -84,7 +107,8 @@ if ! installed; then
   [ "$KIND" = json ] && warn "Для переноса лучше использовать полный бэкап."
   confirm "Запустить установку с восстановлением из бэкапа?" y || exit 0
   INST="$(get_installer)"
-  exec bash "$INST" --dir "$APP_DIR" --restore "$FILE"
+  rc=0; bash "$INST" --dir "$APP_DIR" --restore "$FILE" || rc=$?
+  rm -f "$INST"; cleanup_dec; exit "$rc"
 fi
 
 # --- 3. восстановление поверх существующей установки -------------------------------
@@ -115,7 +139,7 @@ chmod 600 "$SAFE"
 log "Сохранено: $SAFE ($(du -h "$SAFE" | cut -f1))"
 log "Откат при необходимости: повторно запустите restore.sh $SAFE"
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"; cleanup_dec' EXIT
 
 # --- .env из полного бэкапа (показываем только ключи, не значения) --------------
 ENV_CHANGED=0
