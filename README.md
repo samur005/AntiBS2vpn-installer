@@ -70,6 +70,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/samur005/AntiBS2vpn-installe
 
 ## Восстановление из бэкапа на новом сервере (RESTORE)
 
+Подробная инструкция: [BACKUP_RESTORE.md](BACKUP_RESTORE.md)
+
 ### Какие бэкапы делает бот
 | Файл | Когда (по умолч.) | Что внутри | Куда |
 |---|---|---|---|
